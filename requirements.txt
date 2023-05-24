@@ -1,0 +1,12 @@
+Pillow
+pillow-heif
+dhash
+click
+sqlalchemy[asyncio]
+aiosqlite
+aiofiles
+throttler
+alembic
+tqdm
+whatimage
+# numba
