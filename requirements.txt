@@ -10,3 +10,6 @@ alembic
 tqdm
 whatimage
 # numba
+filetype
+black
+loguru

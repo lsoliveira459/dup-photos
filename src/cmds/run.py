@@ -1,25 +1,51 @@
+"""
 
-from operator import itemgetter
-from pathlib import Path
-from src.hash import binary, visual, async_binary, async_visual
-from PIL import Image, UnidentifiedImageError
+
+Sources:
+- https://loguru.readthedocs.io/en/stable/resources/recipes.html#interoperability-with-tqdm-iterations
+- https://github.com/uburuntu/throttler
+"""
+
+from typing import Callable, List, Tuple, Dict, Any, BinaryIO
 from tqdm.asyncio import tqdm
-from whatimage import identify_image
 from throttler import throttle_simultaneous
 from functools import partial
-from ..models.files import Session, Files
+from loguru import logger
+import pathlib
 import hashlib
-import click
 import itertools as it
 import aiofiles, aiofiles.os
 import asyncio
+from PIL import Image, UnidentifiedImageError
+from src.hash import binary, visual, async_binary, async_visual
+from ..models.files import Session, Files, engine
+from ..werkzeug.async2sync import async2sync
+from ..werkzeug.filetype import filetype
 
-algorithms_available = tuple(set(hashlib.algorithms_available) | {'visual'})
+logger.remove()
+logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
+
+algorithms_available = tuple(set(hashlib.algorithms_available) | {"visual"})
 
 
-def walk_and_apply(files_iter, enabled_hash):
-    @throttle_simultaneous(count = 3)
-    async def process_file(file):
+async def get_cached_items() -> Dict[str, Dict[str, Dict[str, str]]]:
+    """Helper function to get already processed files and results
+
+    Returns:
+        Dict[str, Dict[str, str]]: _description_
+    """
+    async with Session.begin() as session:
+        coro = await session.execute(Files.select())
+        cached_set = {
+            item[0]: {param: value}
+            for item in coro.fetchall()
+            for param, value in zip(coro.keys(), item) if value
+        }
+    return cached_set
+
+def walk_and_apply(files_iter, cached_files, enabled_hash):
+    @throttle_simultaneous(count=3)
+    async def process(function, file, algo):
         """
         Returns fmt is supported or None and True if should count as file
 
@@ -30,100 +56,99 @@ def walk_and_apply(files_iter, enabled_hash):
             _type_: _description_
         """
         if not await aiofiles.os.path.isfile(file):
-            return file, {}
+            raise RuntimeWarning(f"{str(file)} skipped. Not a file.")
 
-        # async with aiofiles.open(file, 'rb') as opened_file:
-        #     data = await opened_file.read()
-        #     fmt  = identify_image(data)
-        #     if fmt:
-        #         return file, fmt, True
-        #     else:
-        #         return file, None, False
+        fmt    = await filetype.async_(file)
+        result = await function(file, algo)
 
-        try:
-            results = dict()
-            for k, function in enabled_hash.items():
-                results[k] = await function(file)
-        except UnidentifiedImageError:
-            return file, {}
-        else:
-            return file, results
+        return str(file), result, algo, fmt
 
     async def async_dirwalk(files_iter):
-        n_unsupported   = 0
-        ok_files        = {}
+        n_unsupported = 0
+        n_errors       = 0
+        n_directories = 0
+        ok_files      = {}
+        sql_add_buffer= []
+        sql_upd_buffer= []
 
-        tasks = [process_file(file) for file in files_iter]
-        sql_buffer = []
+        def isitcached(file, algo, cached_files):
+            # check if algo was processed for given file
+            return algo in cached_files.get(str(file), {})
 
-        pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks))
+        tasks = [
+            process(function, file, algo)
+            for file in files_iter
+            for algo, function in enabled_hash.items()
+            if not isitcached(file, algo, cached_files)
+        ]
 
-        for coro in pbar:
+        for coro in tqdm(asyncio.as_completed(tasks),
+                         initial = len(cached_files),
+                         total   = len(cached_files) + len(tasks)):
             try:
-                file, results = await coro
-                pbar.set_description(f"{file} {results}")
-            except OSError:
+                file, results, algo, fmt = await coro
+            except UnidentifiedImageError as exc:
                 n_unsupported += 1
+                logger.warning(f'Format not supported. {str(exc)}')
+            except OSError as exc:
+                n_errors += 1
+                logger.error(f"Error reading file. {str(exc)}")
+            except RuntimeWarning as exc:
+                n_directories += 1
+                logger.error(f"Not a file. Skipping. {str(exc)}")
             else:
-                if results:
-                    ok_files[file] = results
-                    results['path'] = str(file)
+                if not isitcached(file, algo, cached_files):
+                    cached_file = cached_files.get(file, {})
+                    if not cached_file:
+                        item = {h: None for h in enabled_hash.keys()} | {
+                            "path": file,
+                            "filetype": fmt,
+                            algo: results,
+                        }
+                        sql_add_buffer.append(item)
+                    else:
+                        item = cached_file | {algo: results}
+                        sql_upd_buffer.append(item)
+                    cached_files[file] = item
 
-                    sql_buffer.append(results)
 
-                    if len(sql_buffer) > 10:
-                        async with Session.begin() as session:
-                            await session.execute(Files.insert(), sql_buffer)
-                            sql_buffer = []
-                else:
-                    n_unsupported += 1
+                if len(sql_add_buffer) + len(sql_upd_buffer) >= 25:
+                    logger.info(f"Sending last {len(sql_add_buffer)+len(sql_upd_buffer)} files db.")
+                    async with Session.begin() as session:
+                        if sql_add_buffer:
+                            await session.execute(Files.insert(), sql_add_buffer)
+                            sql_add_buffer = []
+                        if sql_upd_buffer:
+                            await session.execute(Files.update(), sql_upd_buffer)
+                            sql_upd_buffer = []
+                    logger.debug(f"Files saved on db.")
 
-        return ok_files, n_unsupported
+        return ok_files, (n_unsupported, n_directories, n_errors)
 
-    loop = asyncio.get_event_loop()
-    coroutine = async_dirwalk(files_iter)
-    return loop.run_until_complete(coroutine)
+    return async2sync(async_dirwalk(files_iter))
 
 
 def cmd(*args, **kwargs):
-    click.echo('Initiating RUN command')
-    click.echo(f'{args}\n{kwargs}')
+    logger.info("Initiating RUN command")
+    logger.info(f"{args}\n{kwargs}")
 
     # Prepare functions to run hashes
-    enabled_hash = {v: partial(async_binary, **{}) for v in kwargs.get('hash', tuple())}
+    enabled_hash = {v: partial(async_binary, **{}) for v in kwargs.get("hash", tuple())}
 
-    if 'visual' in kwargs['hash']:
-        enabled_hash['visual'] = partial(async_visual, **{})
+    if "visual" in kwargs["hash"]:
+        enabled_hash["visual"] = partial(async_visual, **{})
 
     # Prepare list of files to process
-    directories = kwargs.get('directory', tuple())
-    files_iter  = it.chain(*(Path(v).iterdir() for v in directories))
+    directories = kwargs.get("directory", tuple())
+    files_iter = it.chain(*(pathlib.Path(v).iterdir() for v in directories))
 
-    ok_files, n_unsupported, results = walk_and_apply(files_iter, enabled_hash)
+    cached_files = async2sync(get_cached_items())
 
-    click.echo(f'{len(ok_files)} unique files processed ({n_unsupported} unsupported files)')
+    ok_files, (n_unsupported, n_directories, n_errors) = walk_and_apply(
+        files_iter, cached_files, enabled_hash
+    )
 
-
-# with Path('X:\\Photos') as root:
-#     items = {i for i in root.iterdir()}
-
-#     print(f'{root.absolute()}: {len(items)} files found in folder')
-
-#     for k, item in enumerate(items):
-#         if not item.is_file():
-#             continue
-#         try:
-#             with Image.open(item) as im:
-#                 print(f'{item}:', end=' ')
-#                 print(f'{item.stat().st_size}, {im.format}, {im.size}, {im.mode}', end=' ')
-
-#                 row, col = dhash.dhash_row_col(im)
-#                 hash_value = dhash.format_hex(row, col)
-#                 bin_hash_value = compute_hash(item)
-
-#             print(f'{hash_value} {bin_hash_value}')
-
-#             if k == 3:
-#                 break
-#         except UnidentifiedImageError:
-#             print(f'{item}: Format not supported')
+    logger.info(
+        f"{len(ok_files)} unique files processed \
+               ({n_unsupported} unsupported files, {n_directories} diretories skipped, {n_errors} file access failed)"
+    )

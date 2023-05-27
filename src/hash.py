@@ -1,8 +1,15 @@
+"""
+_summary_
+
+Sources:
+- [stackoverflow.com/.../fast-way-of-counting-non-zero-bits-in-positive-integer](https://stackoverflow.com/a/64848298)
+"""
 from pathlib import Path
 from hashlib import file_digest
 from PIL import Image, UnidentifiedImageError
-import click
 import dhash
+from loguru import logger
+from io import StringIO
 
 
 def binary(filepath: str | Path,
@@ -17,14 +24,14 @@ def binary(filepath: str | Path,
 
     Args:
         filepath (str | Path): File path as string of pathlib.Path
-        hash_algorithm (str | Callable[[str], hashlib._Hash], optional): _description_. Defaults to 'md5'.
+        hash_algorithm (str | Callable[[str], hashlib._Hash], optional): Defaults to 'md5'.
         buffering (int, optional): Buffer in bytes. Defaults to 65536.
 
     Returns:
         str: Return hexdigest from hashlib
     """
-    with open(filepath, 'rb', buffering=buffering) as f:
-        return file_digest(f, hash_algorithm).hexdigest()
+    with open(filepath, 'rb', buffering=buffering) as file:
+        return file_digest(file, hash_algorithm).hexdigest()
 
 async def async_binary(*args, **kwargs):
     return binary(*args, **kwargs)
@@ -34,21 +41,14 @@ def visual(filepath: str | Path,
             buffering: int = 65536,
             **kwargs):
     try:
-        file_size = filepath.stat().st_size
-
         with Image.open(filepath) as im:
-            fmt  = im.format
-
-            #click.echo(f'{filepath}: ', nl=False)
-            #click.echo(f'{file_size}, {fmt}, {im.size}, {im.mode} ', nl=False)
-
             row, col = dhash.dhash_row_col(im)
             hash_value = dhash.format_hex(row, col)
-    except UnidentifiedImageError as e:
-        click.echo(err = f'{filepath}: Format not supported')
-        raise e
+            return hash_value
 
-    return hash_value
+    except UnidentifiedImageError as exc:
+        logger.warning(f'{filepath}: Format not supported')
+        raise exc
 
 async def async_visual(*args, **kwargs):
     return visual(*args, **kwargs)

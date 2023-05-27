@@ -1,5 +1,6 @@
 import click
-from ..models.files import metadata, engine, async_create_all, async_drop_all, async2sync
+from ..models.files import metadata, engine, async_create_all, async_drop_all
+from ..werkzeug.async2sync import async2sync
 from .run import cmd as run_cmd, algorithms_available
 from pillow_heif import register_heif_opener
 
