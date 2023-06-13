@@ -1,21 +1,24 @@
-
-from tkinter import Image
-from typing import Callable, List, Dict, Any, BinaryIO
-from PIL import UnidentifiedImageError
-from loguru import logger
-import filetype as filetype_lib
-import PIL
+import asyncio
 import pathlib
+from typing import Any
+
 import aiofiles
 import aiofiles.os
-import asyncio
+import filetype as filetype_lib
+import PIL
 import whatimage
-from ..werkzeug.async2sync import async2sync
+from loguru import logger
+from PIL import UnidentifiedImageError
+
 
 class filetype:
     @classmethod
     def __call__(cls, *args, **kwargs) -> str:
         return async2sync(cls.async_, *args, **kwargs)
+
+    @classmethod
+    def is_image(cls, mime: str):
+        return (mime.split('/')[0] == 'image') if mime else False
 
     @staticmethod
     def _whatimage(file: str | pathlib.Path | Any) -> str:

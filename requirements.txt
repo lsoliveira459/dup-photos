@@ -9,7 +9,10 @@ throttler
 alembic
 tqdm
 whatimage
-# numba
+numba
 filetype
 black
 loguru
+perception
+opencv-python
+orjson

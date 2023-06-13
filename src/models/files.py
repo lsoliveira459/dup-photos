@@ -1,38 +1,83 @@
 """
 Defining db connections, tables and helper functions.
-TODO: Breakdown files.py into multiple files, modules and functions for readability and maintainability.
 
 Sources:
 - [stackoverflow.com/../database-on-the-fly-with-scripting-languages](https://stackoverflow.com/a/2580543):
     On how to work with sqlalchemy.Table to dinamically create Columns.
 """
-from sqlalchemy import MetaData, Table, Column, String, JSON
-from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from typing import Any, Optional
 
-from hashlib import algorithms_available
-import asyncio
+from sqlalchemy import Column, ForeignKey, String, Table, func, select
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-engine = create_async_engine("sqlite+aiosqlite:///database.db")
-metadata = MetaData()
+from src.models import Base, Session
 
-Files = Table(
-    "files",
-    metadata,
-    Column("path", String, primary_key=True),
-    Column("filetype", JSON, index=True),
-    Column("visual", String),
-    *(Column(rowname, String) for rowname in algorithms_available)
+association_table = Table(
+    "association_table",
+    Base.metadata,
+    Column("file_id", ForeignKey("files.id"), primary_key=True),
+    Column("hash_id", ForeignKey("hashes.id"), primary_key=True),
 )
 
-Session = sessionmaker(engine, autoflush=True, class_=AsyncSession)
+class Files(Base):
+    __tablename__ = "files"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    path: Mapped[str] = mapped_column(String)
+    filetype: Mapped[Optional[str]]
+    hashes: Mapped[list["Hashes"]] = relationship(secondary=association_table,
+                                                 back_populates="files",)
 
+    def __repr__(self) -> str:
+        return f"Files(path={self.path!r}, filetype={self.filetype!r}, hashes={len(self.hashes)})"
 
-async def async_create_all(engine):
-    async with engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
+    @classmethod
+    async def get_one(cls, path):
+        async with Session.begin() as session:
+            query = select(Files).filter_by(path = path).scalar_one()
+            item = await session.execute(query)
+            return item
 
+    @classmethod
+    async def get_cached_items(cls):
+        async with Session.begin() as session:
+            query = select(cls.path, Hashes.hashtype)\
+                .join_from(Files, association_table)\
+                .join(Hashes)
+            result = await session.stream(query)
+            return {(row.path, row.hashtype) async for row in result}
 
-async def async_drop_all(engine):
-    async with engine.begin() as conn:
-        await conn.run_sync(metadata.drop_all)
+    @classmethod
+    async def is_it_cached(cls):
+        raise NotImplementedError()
+
+    @classmethod
+    async def total_cached(cls) -> int:
+        async with Session.begin() as session:
+            count_query = select(func.count(Files.id))
+            result = await session.execute(count_query)
+            return result.scalar()
+        # return sum(1 for f in cached_files.values() for _ in f.keys())
+
+    @classmethod
+    async def update_hashes(cls, file, hashes: list["Hashes"]) -> None:
+        async with Session.begin() as session:
+            query = select(cls).filter_by(path = file)
+            item = (await session.execute(query)).scalar_one()
+            item.hashes.update(hashes)
+
+class Hashes(Base):
+    __tablename__ = "hashes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    hashtype: Mapped[str] = mapped_column(String)
+    hashvalue: Mapped[str] = mapped_column(String)
+    files: Mapped[list["Files"]] = relationship(secondary=association_table,
+                                               back_populates="hashes",)
+
+    def __repr__(self) -> str:
+        return f"Hashes(id={self.id!r}, file={self.file.path!r}, )"
+
+async def add_all(buffer: list[Any]):
+    async with Session.begin() as session:
+        if buffer:
+            session.add_all(buffer)
